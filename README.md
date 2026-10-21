@@ -36,3 +36,33 @@ python -m pip install -r requirements.txt
 python -m pytest tests/ -v
 python solution.py data/<задача>
 ```
+
+## Локальный тестовый цикл
+
+Проверка полного цикла на простой синтетической задаче `examples/simple_task`:
+
+```bash
+python -m pip install -r requirements-dev.txt
+
+# заполнить .env: OpenAI-совместимый бэкенд
+# (DeepSeek / Groq / Ollama / прокси организаторов)
+cp .env.example .env
+
+# сгенерировать тестовую задачу
+python scripts/make_demo_task.py
+
+# прогон без LLM: проверяет песочницу, метрику и accept/reject
+python scripts/run_cycle.py --task examples/simple_task --cycles 2 --dry-run
+
+# реальный прогон (нужен .env)
+python scripts/run_cycle.py --task examples/simple_task --cycles 2
+```
+
+- `--cycles N` — сколько гипотез проверить;
+- `--timeout S` — лимит на исполнение сгенерированного кода (по умолчанию 300 с);
+- `--dry-run` — заготовки вместо вызова модели, но код исполняется по-настоящему;
+- логи: `logs/llm.jsonl`, `logs/exec.jsonl`;
+- тесты инструментов: `python -m pytest tests/ -q`.
+
+`requirements-dev.txt` — только для локальной разработки; в ZIP для платформы
+идёт `requirements-org.txt` (переименовывается в `requirements.txt`).
