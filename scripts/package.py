@@ -1,13 +1,24 @@
 """Сборка сабмит-архива для платформы (зона капитана).
 
-Что кладём в ZIP:
-    solution.py       — точка входа (контракт: uv run solution.py task.md)
-    agent/**          — код агента: только *.py и agent/prompts/*.md
-    requirements.txt  — requirements-org.txt под именем, которое ждёт платформа
+Контракт платформы (инструкция организаторов, раздел «Что положить в ZIP»):
+- все файлы лежат в КОРНЕ архива, без папок;
+- в каталог задачи копируются только корневые .py-файлы и requirements.txt;
+- вложенные папки НЕ копируются: необходимый модуль в подпапке недоступен
+  при запуске (риск 0 баллов); не-.py файлы (промпты, конфиги) тоже
+  не копируются.
 
-Что НЕ должно попасть (проверяется явно):
-    .env и секреты, tests/, scripts/, reference/, examples/, logs/,
-    __pycache__, .git, README и прочая дев-обвязка.
+Поэтому архив состоит ровно из двух файлов в корне:
+- solution.py — АВТОГЕНЕРАТ: bootstrap-заголовок распаковывает встроенный
+  сжатый пакет agent/ (только .py и .md из репозитория) в подкаталог
+  _agent_rt/ каталога задачи (промежуточные файлы в подкаталогах задачи
+  разрешены инструкцией) и затем выполняется исходный код solution.py,
+  приложенный в конец файла без изменений;
+- requirements.txt — requirements-org.txt под именем, которое ждёт платформа.
+
+Проверки перед сборкой (блокируют сабмит):
+    синтаксис всех .py; случайно закоммиченные секреты (sk-/gsk-, ключи в
+    коде); отсутствие solution.py / requirements-org.txt / agent/__init__.py.
+    После записи: в архиве ровно 2 корневые записи, автогенерат компилируется.
 
 Запуск:
     python scripts/package.py               # соберёт dist/solution.zip
@@ -15,21 +26,20 @@
     python scripts/package.py --out my.zip  # свой путь
 
 Код возврата: 0 — архив готов; 1 — сабмит заблокирован (читай сообщения).
-Пока solution.py не запушен (зона A), скрипт честно скажет об этом —
-это фича: он не даст собрать пустой архив.
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import re
 import zipfile
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENT = ROOT / "agent"
 EXCLUDED_PARTS = {"__pycache__", ".pytest_cache", ".git", ".venv", "logs", "dist"}
-FORBIDDEN_PREFIXES = (".env", "tests/", "scripts/", "reference/", "examples/")
 
 # Назначение секретного значения или вставленный ключ (sk-…, gsk-…)
 SECRET_RE = re.compile(
@@ -71,6 +81,59 @@ def scan_problems(files: list[Path]) -> list[str]:
     return problems
 
 
+def build_payload(files: list[Path]) -> dict[str, bytes]:
+    """Упаковать agent/** в {относительный posix-путь: zlib+b85(байты)}."""
+    payload: dict[str, bytes] = {}
+    for p in files:
+        rel = p.relative_to(ROOT).as_posix()
+        payload[rel] = base64.b85encode(zlib.compress(p.read_bytes(), 9))
+    return payload
+
+
+def build_standalone(payload: dict[str, bytes], original: str) -> str:
+    """Сгенерировать самодостаточный solution.py: bootstrap + исходник.
+
+    Bootstrap выполняется до исходного кода: распаковывает _PAYLOAD в
+    подкаталог _agent_rt/ рядом с собой и добавляет его в sys.path. Далее
+    работает исходный solution.py (appended as-is): его «from agent import
+    ...» находит материализованный пакет, промпты .md лежат на месте.
+    """
+    head = (
+        "# -*- coding: utf-8 -*-\n"
+        "# solution.py — АВТОГЕНЕРАТ scripts/package.py. Не править руками:\n"
+        "# изменения вносятся в решение в репозитории, архив пересобирается\n"
+        "# package.py. Платформа копирует в каталог задачи только корневые\n"
+        "# .py-файлы и requirements.txt (инструкция организаторов), поэтому\n"
+        "# пакет agent/ встроен ниже сжатым блоком и распаковывается при\n"
+        "# старте в подкаталог _agent_rt/ (промежуточные файлы в подкаталогах\n"
+        "# задачи разрешены).\n"
+        "import base64 as _b64\n"
+        "import sys as _sys\n"
+        "import zlib as _zlib\n"
+        "from pathlib import Path as _Path\n\n"
+        "_RT_DIR = _Path(__file__).resolve().parent / \"_agent_rt\"\n"
+        "_PAYLOAD = "
+    )
+    body = (
+        "\n\n"
+        "def _materialize() -> None:\n"
+        "    for _rel, _blob in _PAYLOAD.items():\n"
+        "        _target = _RT_DIR.joinpath(*_rel.split(\"/\"))\n"
+        "        _target.parent.mkdir(parents=True, exist_ok=True)\n"
+        "        _target.write_bytes(_zlib.decompress(_b64.b85decode(_blob)))\n"
+        "    _p = str(_RT_DIR)\n"
+        "    if _p not in _sys.path:\n"
+        "        _sys.path.insert(0, _p)\n"
+        "\n\n"
+        "_materialize()\n"
+        "del _b64, _sys, _zlib, _Path, _RT_DIR, _PAYLOAD, _materialize\n"
+        "\n"
+        "# ---- ниже исходный solution.py из репозитория (без изменений) ----\n"
+        "\n"
+    )
+    return head + repr(payload) + body + original
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Сборка сабмит-архива")
     parser.add_argument("--out", default="dist/solution.zip", help="путь к ZIP")
@@ -89,10 +152,15 @@ def main() -> int:
     if not (AGENT / "__init__.py").exists():
         problems.append("agent/__init__.py отсутствует — пакет не импортируется")
 
-    files = ([solution] if solution.exists() else []) + agent_files()
-    if not agent_files():
+    files = agent_files()
+    if not files:
         problems.append("пакет agent/ пуст или не найден")
-    problems.extend(scan_problems(files + [req] if req.exists() else files))
+    scan_list = files[:]
+    if solution.exists():
+        scan_list.append(solution)
+    if req.exists():
+        scan_list.append(req)
+    problems.extend(scan_problems(scan_list))
 
     if problems:
         print("БЛОКЕРЫ САБМИТА:")
@@ -100,33 +168,45 @@ def main() -> int:
             print(f"  - {item}")
         return 1
 
-    entries = [(p, p.relative_to(ROOT)) for p in files]
-    entries.append((req, Path("requirements.txt")))  # переименование для платформы
+    payload = build_payload(files)
+    standalone = build_standalone(payload, solution.read_text(encoding="utf-8"))
+
+    # автогенерат обязан компилироваться ещё до записи в архив
+    try:
+        ast.parse(standalone)
+    except SyntaxError as exc:
+        print(f"БЛОКЕР САБМИТА: автогенерат solution.py не компилируется: {exc}")
+        return 1
 
     if args.check:
-        print(f"Проверки пройдены. В архив вошло бы {len(entries)} файлов:")
-        for _, arc in sorted(entries, key=lambda e: str(e[1])):
-            print(f"    {arc}")
+        print("Проверки пройдены. Архив: 2 корневые записи, без папок.")
+        print("    solution.py — автогенерат, внутри пакета agent/:")
+        for rel in sorted(payload):
+            print(f"      + {rel}")
+        print("    requirements.txt")
         return 0
 
     out = ROOT / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        for src, arc in entries:
-            zf.write(src, str(arc))
+        zf.writestr("solution.py", standalone)
+        zf.writestr("requirements.txt", req.read_text(encoding="utf-8"))
 
     with zipfile.ZipFile(out) as zf:
         names = zf.namelist()
-    leaked = [n for n in names
-              if n.startswith(FORBIDDEN_PREFIXES) or "__pycache__" in n or n == ".env"]
-    if leaked:
+    expected = {"solution.py", "requirements.txt"}
+    bad = [n for n in names if n not in expected or "/" in n or "\\" in n]
+    if set(names) != expected or bad:
         out.unlink(missing_ok=True)
-        print(f"ОШИБКА: в архив попало лишнее: {leaked}")
+        print(f"ОШИБКА: структура архива не плоская: {names}")
         return 1
 
-    print(f"OK: {out} — {len(names)} файлов, {out.stat().st_size / 1024:.1f} KB")
-    for name in sorted(names):
-        print(f"    {name}")
+    print(f"OK: {out} — {len(names)} файла (плоско, без папок), "
+          f"{out.stat().st_size / 1024:.1f} KB")
+    print("    solution.py — автогенерат, внутри пакета agent/:")
+    for rel in sorted(payload):
+        print(f"      + {rel}")
+    print("    requirements.txt")
     return 0
 
 
