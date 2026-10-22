@@ -16,3 +16,4 @@ examples/**/metrics.json
 to_do.md
 
 .pytest_cache/
+dist/
