@@ -12,7 +12,19 @@ from pathlib import Path
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 BASE_ROLE = "agent_instruction"
-ROLES = (BASE_ROLE, "analyze_task", "hypothesis", "code", "review")
+# Роли: демо-цикл (hypothesis/code/review) и продовый цикл агента
+# (hypothesis_batch — пачка кандидатов, patch — функция признаков).
+ROLES = (
+    BASE_ROLE,
+    "analyze_task",
+    "hypothesis",
+    "hypothesis_batch",
+    "code",
+    "patch",
+    "review",
+    "portfolio",
+    "node_edit",
+)
 
 
 @lru_cache(maxsize=None)

@@ -67,6 +67,11 @@ class LoopConfig:
     exp_timeout_cap: float = 2400.0  # потолок на один эксперимент
     batch_size: int = 4              # кандидатов в одном запросе к LLM
     llm_timeout: float = 180.0
+    search: str = "tree"             # tree — портфель+ветки+ансамбль; spec — старый поиск
+    portfolio_size: int = 6          # сколько семейств пробовать в портфеле
+    branches: int = 0               # 0 — улучшать все ветки; N — только N лучших
+    rounds: int = 6                  # сколько раундов правок делать
+    patience_rounds: int = 0         # 0 — не останавливаться на неудачах раундов
 
     @classmethod
     def from_env(cls) -> "LoopConfig":
@@ -86,6 +91,11 @@ class LoopConfig:
             dry_run=os.getenv("AGENT_DRY_RUN", "").strip().lower() in ("1", "true", "yes"),
             exp_timeout_cap=_env_float("AGENT_EXP_TIMEOUT", cls.exp_timeout_cap),
             batch_size=int(_env_float("AGENT_BATCH_SIZE", cls.batch_size)),
+            search=os.getenv("AGENT_SEARCH", cls.search).strip().lower() or cls.search,
+            portfolio_size=int(_env_float("AGENT_PORTFOLIO_SIZE", cls.portfolio_size)),
+            branches=int(_env_float("AGENT_BRANCHES", cls.branches)),
+            rounds=int(_env_float("AGENT_ROUNDS", cls.rounds)),
+            patience_rounds=int(_env_float("AGENT_TREE_PATIENCE", cls.patience_rounds)),
         )
 
 
@@ -264,7 +274,8 @@ def main():
             y_fit = np.log1p(y)
 
     res = tools.train_eval(X, y_fit, X_test, task, params=spec["lgbm_params"] or None,
-                           class_weight=spec["class_weight"], time_limit=cfg["time_limit"])
+                           class_weight=spec["class_weight"], time_limit=cfg["time_limit"],
+                           family=spec.get("model_family", "lgbm"))
     oof, test_pred, done = res["oof"], res["test_pred"], res["folds_done"]
     if task == "regression" and spec["target_transform"] == "log1p":
         oof, test_pred = np.expm1(oof), np.expm1(test_pred)
@@ -488,6 +499,25 @@ def menu(ctx: TaskContext, best: ExperimentSpec) -> list[Candidate]:
                   "model", {"lgbm_params": {"colsample_bytree": 0.5}},
                   expected_gain="low", cost="low"),
     ]
+    # Другие семейства моделей: дешёвая страховка от того, что на скрытой
+    # задаче бустинг в принципе не подходит (линейная зависимость, мало строк).
+    for family, title, why, gain, cost in (
+        ("ridge", "Линейная модель (Ridge / LogReg)",
+         "Другое семейство: если зависимость близка к линейной, бустинг проигрывает "
+         "по обобщению — проверяем это отдельным экспериментом.", "med", "low"),
+        ("extratrees", "ExtraTrees (баггинг вместо бустинга)",
+         "Другое семейство деревьев: ошибки менее коррелированы с бустингом, "
+         "на маленьких выборках обобщает иначе.", "low", "med"),
+    ):
+        if best.model_family != family:
+            out.append(Candidate(title, why, "model", {"model_family": family},
+                                 expected_gain=gain, cost=cost))
+    if best.model_family != "lgbm":
+        out.append(Candidate(
+            "Вернуться на LightGBM",
+            "Если другое семейство не дало прироста, возвращаемся к бустингу: "
+            "его гиперпараметры после смены семейства сброшены.",
+            "model", {"model_family": "lgbm"}, expected_gain="med", cost="med"))
     if ctx.task_type == "regression":
         stats = ctx.profile.get("target_stats", {})
         if ctx.profile.get("target_skew", 0) > 1 and stats.get("min", -1) > -1:
@@ -550,30 +580,6 @@ CANDIDATES_SCHEMA = {
     "required": ["candidates"],
 }
 
-BATCH_INSTRUCTION = """\
-# Задача
-
-Предложи {k} РАЗНЫХ кандидатов-гипотез для улучшения текущей лучшей модели.
-Модель и CV фиксированы каркасом: LightGBM, 5-fold, метрику считает каркас.
-Каждый кандидат — ОДНО атомарное изменение относительно текущей лучшей спеки.
-
-# Что можно менять (поле delta)
-
-- "lgbm_params": {{...}} — только ключи: {params}.
-- "class_weight": null | "balanced"  (только классификация).
-- "target_transform": null | "log1p"  (только регрессия, таргет > -1).
-- "postprocess": null | "class_weight_opt"  (только классификация: подбор весов под Macro F1).
-- Новые признаки: delta = {{}}, а в "feature_idea" — конкретное описание, какие признаки
-  построить из каких колонок (имена колонок — точно как в списке). Код напишет отдельный шаг.
-
-# Правила
-
-- Не повторяй уже проверенные гипотезы из истории; учитывай, что не сработало.
-- Признаки должны вычисляться построчно или по train+test без таргета.
-- expected_gain / cost: low | med | high (cost — время обучения).
-- change_type: feature | encoding | preprocessing | model | validation | ensemble | other.
-"""
-
 
 def _sanitize_delta(ctx: TaskContext, delta: dict) -> dict:
     """
@@ -587,6 +593,9 @@ def _sanitize_delta(ctx: TaskContext, delta: dict) -> dict:
     dict: очищенная дельта (может быть пустой)
     """
     clean: dict = {}
+    family = delta.get("model_family")
+    if isinstance(family, str) and family in tools.MODEL_FAMILIES:
+        clean["model_family"] = family
     params = {}
     for key, value in (delta.get("lgbm_params") or {}).items():
         if key not in PARAM_RANGES or value is None or isinstance(value, bool):
@@ -743,29 +752,23 @@ class LLMGate:
             self.log.log(kind="llm_disabled", reason="2 сбоя подряд")
 
 
-def _llm_query(system_extra: str, user: str, *, schema: dict | None, role: str,
-               timeout: float):
+def _llm_query(role: str, user: str, *, schema: dict | None, timeout: float):
     """
-    Вызывает LLM: системный промпт agent_instruction + инструкция шага.
+    Вызывает LLM; системный промпт роли подставляет llm.query.
 
     Аргументы:
-    system_extra (str): инструкция шага (батч гипотез / патч признаков)
-    user (str): пользовательское сообщение
+    role (str): роль из agent/prompts.py (hypothesis_batch | patch)
+    user (str): контекст задачи и запрос шага (что именно нужно от модели)
     schema (dict | None): JSON-схема ответа; None — текстовый ответ
-    role (str): роль для логов
     timeout (float): лимит ожидания ответа, секунды
 
     Возвращает:
-    dict | str
+    dict | str: для роли patch — уже вырезанный из markdown код
     """
     from . import llm
-    from .prompts import build_system
 
-    messages = [
-        {"role": "system", "content": build_system("agent_instruction") + "\n\n" + system_extra},
-        {"role": "user", "content": user},
-    ]
-    return llm.query(messages, schema=schema, role=role, phase="RESEARCH", timeout=timeout)
+    return llm.query([{"role": "user", "content": user}], role=role, schema=schema,
+                     phase="RESEARCH", timeout=timeout)
 
 
 DRY_CANDIDATES = {"candidates": [
@@ -810,10 +813,11 @@ def propose_llm(ctx: TaskContext, reg: Registry, cfg: LoopConfig, gate: LLMGate)
     """
     if cfg.dry_run:
         return _parse_candidates(ctx, DRY_CANDIDATES)
-    instruction = BATCH_INSTRUCTION.format(k=cfg.batch_size, params=", ".join(PARAM_RANGES))
+    request = (f"## Запрос\nНужно {cfg.batch_size} кандидатов. "
+               f"Разрешённые ключи lgbm_params: {', '.join(PARAM_RANGES)}\n")
     try:
-        data = _llm_query(instruction, _context_block(ctx, reg), schema=CANDIDATES_SCHEMA,
-                          role="hypothesis_batch",
+        data = _llm_query("hypothesis_batch", _context_block(ctx, reg) + "\n" + request,
+                          schema=CANDIDATES_SCHEMA,
                           timeout=min(cfg.llm_timeout, max(30.0, ctx.remaining() / 4)))
         gate.ok()
         return _parse_candidates(ctx, data)
@@ -823,24 +827,6 @@ def propose_llm(ctx: TaskContext, reg: Registry, cfg: LoopConfig, gate: LLMGate)
 
 
 # ----------------------------- патч признаков -----------------------------
-PATCH_INSTRUCTION = """\
-# Задача
-
-Напиши функцию построения признаков по описанию идеи.
-
-# Контракт
-
-```python
-def add_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-```
-- На входе только признаки (без id и таргета), исходные dtypes. Вернуть (train, test)
-  с одинаковым набором колонок и тем же числом строк; добавлять колонки, можно удалять.
-- Статистики (частоты, агрегаты) считай по train+test вместе, таргет недоступен.
-- Импорты: только pandas, numpy, math, re. Никаких файлов, сети, print.
-- Деление — с защитой от нуля; категории можно оставить строками (каркас закодирует).
-- Ответ — один markdown-блок с кодом.
-"""
-
 _ALLOWED_IMPORTS = {"pandas", "numpy", "math", "re"}
 _FORBIDDEN_NAMES = {"open", "exec", "eval", "compile", "__import__", "input", "globals",
                     "locals", "vars", "getattr", "setattr", "delattr", "breakpoint"}
@@ -908,14 +894,12 @@ def generate_feature_patch(ctx: TaskContext, cand: Candidate, cfg: LoopConfig, g
         user += (f"\n## Предыдущая версия упала — исправь\n```python\n{prev_code}\n```\n"
                  f"Ошибка:\n{prev_error[-1500:]}\n")
     try:
-        from .llm import extract_code
-        text = _llm_query(PATCH_INSTRUCTION, user, schema=None, role="feature_patch",
+        code = _llm_query("patch", user, schema=None,
                           timeout=min(cfg.llm_timeout, max(30.0, ctx.remaining() / 4)))
         gate.ok()
     except Exception as exc:  # noqa: BLE001
         gate.fail("feature_patch", exc)
         return None
-    code = extract_code(text)
     problem = check_patch(code)
     if problem:
         get_logger("loop").log(kind="patch_rejected", title=cand.title, problem=problem)
@@ -1178,23 +1162,164 @@ def research(ctx: TaskContext, cfg: LoopConfig, reg: Registry, log) -> None:
             no_improve += 1
 
 
-def finalize(ctx: TaskContext, reg: Registry, log) -> None:
+# ----------------------------- ансамбль -----------------------------------
+# Вес лучшего эксперимента в смеси: 0.5 — равное усреднение, 0.9 — почти
+# лучший, второй лишь чуть сглаживает.
+BLEND_WEIGHTS = (0.5, 0.6, 0.7, 0.8, 0.9)
+
+
+def _true_target(ctx: TaskContext):
     """
-    Пишет сабмит лучшего эксперимента и проверяет его формат.
+    Читает таргет train.csv в том же кодировании, что и RUNNER_CODE.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи
+
+    Возвращает:
+    pd.Series | None: None, если таргет не читается
+    """
+    try:
+        raw = pd.read_csv(ctx.data_dir / "train.csv", usecols=[ctx.target])[ctx.target]
+    except (OSError, ValueError, KeyError):
+        return None
+    if ctx.task_type == "classification":
+        return raw.map({c: i for i, c in enumerate(sorted(raw.unique()))})
+    return raw.astype(float)
+
+
+def _score_pred(ctx: TaskContext, y, pred) -> float:
+    """
+    Считает финальную метрику задачи по предсказаниям.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи (тип, метрика)
+    y (pd.Series): истинный таргет в кодировании RUNNER_CODE
+    pred: 1-D (регрессия) или (n, K) вероятности (классификация)
+
+    Возвращает:
+    float
+    """
+    if ctx.task_type == "classification":
+        return float(tools.macro_f1(y, pred.argmax(axis=1)))
+    return float(tools.rmse(y, pred))
+
+
+def maybe_blend(ctx: TaskContext, reg: Registry, log) -> ExperimentRecord | None:
+    """
+    Усредняет лучший эксперимент с лучшим экспериментом другого семейства.
+
+    Смесь проверяется на OOF (фолды у всех экспериментов одинаковые, поэтому
+    сравнение честное) и принимается только при приросте выше шума.
+    Так на скрытой задаче страхуюсь не моделью одного семейства, а двумя.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи
+    reg (Registry): реестр экспериментов
+    log (JsonlLogger): логгер loop.jsonl
+
+    Возвращает:
+    ExperimentRecord | None: запись смеси или None, если не приняли
+    """
+    best = reg.best()
+    if best is None or not best.artifacts.get("oof") or best.cv_score is None:
+        return None
+    best_family = (best.spec or {}).get("model_family", "lgbm")
+    others = [r for r in reg.records
+              if r.exp_id != best.exp_id and r.status == "ok"
+              and len(r.fold_scores) == tools.N_FOLDS
+              and r.artifacts.get("oof") and r.artifacts.get("test_pred")
+              and (r.spec or {}).get("model_family", "lgbm") != best_family]
+    if not others:
+        log.log(kind="blend_skip", reason="нет эксперимента другого семейства")
+        return None
+    y = _true_target(ctx)
+    if y is None:
+        log.log(kind="blend_skip", reason="таргет не читается")
+        return None
+    try:
+        oof_best = np.load(best.artifacts["oof"])
+        test_best = np.load(best.artifacts["test_pred"])
+    except (OSError, ValueError) as exc:
+        log.log(kind="blend_skip", reason=f"не читаются артефакты лучшего: {exc}"[:300])
+        return None
+    if len(y) != len(oof_best):
+        log.log(kind="blend_skip", reason=f"длина таргета {len(y)} != OOF {len(oof_best)}")
+        return None
+
+    # Перебираем всех партнёров другого семейства: смешивать с самым сильным
+    # не всегда выгодно — лучше выбирать по OOF, а не по положению в реестре.
+    pair = None  # (score, weight, other, oof_other, test_other)
+    for candidate in others:
+        try:
+            oof_other = np.load(candidate.artifacts["oof"])
+            test_other = np.load(candidate.artifacts["test_pred"])
+        except (OSError, ValueError):
+            continue
+        if oof_best.shape != oof_other.shape:
+            continue
+        for weight in BLEND_WEIGHTS:
+            score = _score_pred(ctx, y, weight * oof_best + (1.0 - weight) * oof_other)
+            if pair is None:
+                pair = (score, weight, candidate, oof_other, test_other)
+                continue
+            is_better = score > pair[0] if ctx.direction == "max" else score < pair[0]
+            if is_better:
+                pair = (score, weight, candidate, oof_other, test_other)
+    if pair is None:
+        log.log(kind="blend_skip", reason="нет совместимых по форме партнёров")
+        return None
+    blend_score, weight, other, oof_other, test_other = pair
+    gain = improvement(ctx, best.cv_score, blend_score)
+    min_delta = 0.002 * abs(best.cv_score) if ctx.metric == "rmse" else 0.002
+    if gain < min_delta:
+        log.log(kind="blend_rejected", gain=round(gain, 6), threshold=round(min_delta, 6),
+                weight=weight, best_cv=best.cv_score, blend_cv=round(blend_score, 6),
+                families=[best_family, (other.spec or {}).get("model_family", "lgbm")])
+        return None
+
+    blend_dir = ctx.work_dir / "blend"
+    blend_dir.mkdir(parents=True, exist_ok=True)
+    oof_path = blend_dir / "oof.npy"
+    test_path = blend_dir / "test_pred.npy"
+    np.save(oof_path, weight * oof_best + (1.0 - weight) * oof_other)
+    np.save(test_path, weight * test_best + (1.0 - weight) * test_other)
+    other_family = (other.spec or {}).get("model_family", "lgbm")
+    rec = ExperimentRecord(
+        exp_id=reg.next_id(), parent_id=best.exp_id, phase="FINALIZE",
+        candidate={"title": f"смесь {best_family} + {other_family}",
+                   "rationale": f"вес лучшего {weight:.1f}, OOF-прирост {gain:+.5g}",
+                   "change_type": "ensemble", "delta": {}},
+        spec=best.spec, signature=f"{best.signature}-blend", status="ok",
+        cv_score=float(blend_score), duration=0.0, accepted=True,
+        reason=f"blend w={weight:.1f}: {best_family}+{other_family}, Δ={gain:+.5g}",
+        artifacts={"oof": str(oof_path), "test_pred": str(test_path)},
+    )
+    reg.add(rec)
+    log.log(kind="blend_accepted", exp_id=rec.exp_id, weight=weight, cv_score=rec.cv_score,
+            best_cv=best.cv_score, families=[best_family, other_family])
+    return rec
+
+
+def finalize(ctx: TaskContext, reg: Registry, log, write_best: bool = True) -> None:
+    """
+    Пишет сабмит лучшего эксперимента (если нужно) и проверяет формат.
 
     Аргументы:
     ctx (TaskContext): контекст задачи
     reg (Registry): реестр
     log (JsonlLogger): логгер loop.jsonl
+    write_best (bool): перезаписывать ли сабмит лучшим экспериментом;
+        в режиме дерева сабмит уже сформирован ансамблем листьев
     """
     best = reg.best()
-    if best is not None and best.artifacts.get("test_pred"):
+    if write_best and best is not None and best.artifacts.get("test_pred"):
         write_submission(ctx, best)
     if ctx.submission_path.exists():
         sub = pd.read_csv(ctx.submission_path)
         errors = tools.validate_submission(sub, ctx.sample)
         log.log(kind="finalize", best_exp=best.exp_id if best else None,
-                cv_score=best.cv_score if best else None, submission_errors=errors)
+                cv_score=best.cv_score if best else None, submission_errors=errors,
+                wrote_best=write_best)
         if errors:
             raise ValueError("Невалидный сабмит: " + "; ".join(errors))
     else:
@@ -1229,23 +1354,42 @@ def run(task_md: str | Path, t0: float | None = None, cfg: LoopConfig | None = N
     log.log(kind="phase", phase="BASELINE", remaining=round(ctx.remaining()))
     base = run_baseline_phase(ctx, cfg, reg, log)
 
-    if base is not None:
-        log.log(kind="phase", phase="RESEARCH", remaining=round(ctx.remaining()),
-                baseline_cv=base.cv_score)
+    log.log(kind="phase", phase="RESEARCH", remaining=round(ctx.remaining()),
+            baseline_cv=base.cv_score if base else None)
+
+    # Два режима поиска: дерево (портфель -> ветки -> ансамбль) и старый
+    # инкрементальный поиск по дельтам спеки. Переключается AGENT_SEARCH.
+    tree_summary = None
+    if cfg.search == "tree":
+        try:
+            from .tree import search as tree_search
+            tree_summary = tree_search(ctx, cfg, log)
+        except Exception as exc:  # noqa: BLE001 — сабмит бейзлайна уже записан
+            log.log(kind="tree_error", error=f"{type(exc).__name__}: {exc}")
+    elif base is not None:
         try:
             research(ctx, cfg, reg, log)
         except Exception as exc:  # noqa: BLE001 — лучший результат уже в сабмите
             log.log(kind="research_error", error=f"{type(exc).__name__}: {exc}")
 
     log.log(kind="phase", phase="FINALIZE", remaining=round(ctx.remaining()))
-    finalize(ctx, reg, log)
+    if cfg.search != "tree" and ctx.remaining() > 120:
+        try:  # смесь — необязательный шаг: сабмит лучшего уже записан
+            maybe_blend(ctx, reg, log)
+        except Exception as exc:  # noqa: BLE001
+            log.log(kind="blend_error", error=f"{type(exc).__name__}: {exc}")
+    finalize(ctx, reg, log, write_best=(cfg.search != "tree"))
     best = reg.best()
     summary = {
         "task_type": ctx.task_type, "metric": ctx.metric,
         "baseline_cv": base.cv_score if base else None,
-        "best_cv": best.cv_score if best else None,
+        "best_cv": (tree_summary or {}).get("ensemble_cv") or
+                   (tree_summary or {}).get("best_cv") or (best.cv_score if best else None),
         "best_exp": best.exp_id if best else None,
         "n_experiments": len(reg.records),
+        "n_nodes": (tree_summary or {}).get("nodes"),
+        "submission_from": (tree_summary or {}).get("submission_from"),
+        "search": cfg.search,
         "elapsed": round(time.time() - t0, 1),
     }
     log.log(kind="done", **summary)

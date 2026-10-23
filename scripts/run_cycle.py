@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agent.llm import complete, get_usage  # noqa: E402
+from agent.llm import get_usage, query  # noqa: E402
 from agent.sandbox import run_python  # noqa: E402
 import console_ui as ui  # noqa: E402
 
@@ -94,14 +94,14 @@ DRY_REVIEW = {
 def llm_complete(
     role: str, user: str, dry_run: bool, phase: str = "RESEARCH"
 ) -> str | dict:
-    """Вызов модели; в dry-run — заготовленный ответ."""
+    """Вызов модели по роли (промпт и схема — из роли); в dry-run — заготовка."""
     if dry_run:
         return {
             "hypothesis": DRY_HYPOTHESIS,
             "code": DRY_CODE,
             "review": DRY_REVIEW,
         }[role]
-    return complete(role, user, phase=phase)
+    return query([{"role": "user", "content": user}], role=role, phase=phase)
 
 
 # --- данные и профиль -------------------------------------------------------

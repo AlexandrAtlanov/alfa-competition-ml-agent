@@ -17,12 +17,20 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
+from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import f1_score
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 SEED = 42
 N_FOLDS = 5
+# Семейства моделей. LightGBM — дефолт; остальные нужны, чтобы на скрытой
+# задаче не упереться в одно семейство (простая линейная модель или
+# баггинг иногда выигрывают у бустинга).
+MODEL_FAMILIES = ("lgbm", "ridge", "extratrees")
 
 
 # ----------------------------- метрики ------------------------------------
@@ -103,11 +111,45 @@ def prepare_features(train, test, id_col, target):
 
 
 # ----------------------------- модели -------------------------------------
-def make_model(task, n_classes=None, class_weight=None, params=None):
-    """Фабрика модели: LightGBM (LGBMClassifier / LGBMRegressor).
+def make_model(task, n_classes=None, class_weight=None, params=None, family="lgbm"):
+    """Фабрика модели по семейству.
 
-    params переопределяют значения по умолчанию (для гиперпараметров B).
+    Args:
+        task (str): "classification" | "regression".
+        n_classes (int | None): число классов (для LightGBM).
+        class_weight: "balanced" или None.
+        params (dict | None): переопределения гиперпараметров LightGBM;
+            для не-LightGBM семейств игнорируются (их результат несравним
+            с бустингом по этим ключам).
+        family (str): одно из MODEL_FAMILIES.
+
+    Returns:
+        sklearn-совместимая модель с fit/predict(_proba).
+
+    Не-LightGBM семейства не принимают NaN и работают только с числами:
+    prepare_features уже закодировал категории в коды, поэтому достаточно
+    импутера (медиана) и, для линейных, стандартизации.
     """
+    if family == "ridge":
+        if task == "classification":
+            model = LogisticRegression(class_weight=class_weight, max_iter=2000)
+        else:
+            model = Ridge(alpha=1.0)
+        return Pipeline([("impute", SimpleImputer(strategy="median")),
+                         ("scale", StandardScaler()),
+                         ("model", model)])
+    if family == "extratrees":
+        if task == "classification":
+            model = ExtraTreesClassifier(n_estimators=300, n_jobs=8,
+                                         random_state=SEED, class_weight=class_weight)
+        else:
+            model = ExtraTreesRegressor(n_estimators=300, n_jobs=8, random_state=SEED)
+        return Pipeline([("impute", SimpleImputer(strategy="median")),
+                         ("model", model)])
+    # import ленивый: lightgbm тянет свою libomp, и если загрузить его раньше
+    # sklearn, HistGradientBoosting падает с SIGSEGV (дублирующийся OpenMP).
+    import lightgbm as lgb
+
     base = dict(n_estimators=500, learning_rate=0.05, num_leaves=63,
                 subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
                 n_jobs=8, random_state=SEED, verbose=-1)
@@ -124,7 +166,8 @@ def get_splitter(task):
     return KFold(N_FOLDS, shuffle=True, random_state=SEED)
 
 
-def train_eval(X, y, X_test, task, params=None, class_weight=None, time_limit=None):
+def train_eval(X, y, X_test, task, params=None, class_weight=None, time_limit=None,
+               family="lgbm"):
     """Обучает модель по K фолдам.
 
     Возвращает dict: score (OOF), oof, test_pred (среднее по фолдам),
@@ -139,7 +182,7 @@ def train_eval(X, y, X_test, task, params=None, class_weight=None, time_limit=No
     for tr_idx, va_idx in get_splitter(task).split(X, y):
         if time_limit and done > 0 and time.time() - t0 > time_limit:
             break  # не укладываемся — выходим с тем, что есть
-        m = make_model(task, n_classes, class_weight, params)
+        m = make_model(task, n_classes, class_weight, params, family=family)
         m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
         if task == "classification":
             oof[va_idx] = m.predict_proba(X.iloc[va_idx])

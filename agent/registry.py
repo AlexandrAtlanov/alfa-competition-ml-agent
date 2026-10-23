@@ -27,7 +27,8 @@ CHANGE_TYPES = (
 )
 LEVELS = ("low", "med", "high")
 # Ключи дельты, которые понимает merge (всё остальное отбрасывается).
-DELTA_KEYS = ("lgbm_params", "class_weight", "target_transform", "postprocess", "feature_patch")
+DELTA_KEYS = ("model_family", "lgbm_params", "class_weight", "target_transform",
+              "postprocess", "feature_patch")
 
 
 # ----------------------------- спека --------------------------------------
@@ -37,6 +38,7 @@ class ExperimentSpec:
     Полная конфигурация эксперимента (то, что исполняет wrapper в песочнице).
     """
 
+    model_family: str = "lgbm"                       # lgbm | ridge | extratrees
     lgbm_params: dict = field(default_factory=dict)  # поверх дефолтов tools.make_model
     class_weight: str | None = None                  # None | "balanced"
     target_transform: str | None = None              # None | "log1p"
@@ -49,6 +51,10 @@ class ExperimentSpec:
 
         lgbm_params сливаются по ключам (None удаляет ключ);
         feature_patch (str) дописывается в конец списка патчей.
+        Параметры LightGBM хранятся, только пока семейство — LightGBM:
+        иначе дельта вида {"lgbm_params": ...} давала бы новый отпечаток
+        спеки при полностью идентичной модели (и реестр тратил бы на неё
+        эксперимент).
 
         Аргументы:
         delta (dict): изменения, ключи из DELTA_KEYS
@@ -56,16 +62,19 @@ class ExperimentSpec:
         Возвращает:
         ExperimentSpec
         """
-        params = dict(self.lgbm_params)
-        for key, value in (delta.get("lgbm_params") or {}).items():
-            if value is None:
-                params.pop(key, None)
-            else:
-                params[key] = value
+        family = delta.get("model_family", self.model_family)
+        params = dict(self.lgbm_params) if family == "lgbm" else {}
+        if family == "lgbm":
+            for key, value in (delta.get("lgbm_params") or {}).items():
+                if value is None:
+                    params.pop(key, None)
+                else:
+                    params[key] = value
         patches = list(self.feature_patches)
         if delta.get("feature_patch"):
             patches.append(delta["feature_patch"])
         return ExperimentSpec(
+            model_family=family,
             lgbm_params=params,
             class_weight=delta.get("class_weight", self.class_weight),
             target_transform=delta.get("target_transform", self.target_transform),
@@ -100,6 +109,7 @@ class ExperimentSpec:
         dict
         """
         return {
+            "model_family": self.model_family,
             "lgbm_params": self.lgbm_params,
             "class_weight": self.class_weight,
             "target_transform": self.target_transform,

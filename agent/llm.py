@@ -6,12 +6,19 @@
   OPENAI_MODEL) — в проде их подставляет платформа;
 - в локальной разработке значения подхватываются из .env;
 - ретраи только на транзиентные ошибки, с экспоненциальной паузой;
+- для 429 (rate limit) — отдельная фиксированная пауза и лимит попыток
+  (удобно для локального тестирования на Groq);
 - каждый вызов учитывается по токенам и пишется в jsonl-лог.
 
 Структурированный вывод (по ролям):
-- `analyze_task`, `hypothesis`, `review` -> dict, валидируется по схеме
-  из agent/schemas.py (response_format=json_object + локальная проверка);
-- `code` -> str: из ответа вырезается markdown-блок с кодом.
+- роль задаёт и системный промпт (agent/prompts/<role>.md поверх базового),
+  и схему ответа (agent/schemas.py): `analyze_task`, `hypothesis`, `review`
+  -> dict, валидируется локально (response_format=json_object + проверка);
+- `hypothesis_batch`, `patch` — роли цикла с явной схемой от вызывающего;
+- `code`, `patch` -> str: из ответа вырезается markdown-блок с кодом.
+
+`query(role=...)` — единственный вход к модели: промпт и схема по роли
+подставляются автоматически, отдельной обёртки `complete()` больше нет.
 
 Синхронная реализация. При необходимости async-вариант добавляется
 отдельной функцией, не меняя контракт query().
@@ -28,7 +35,7 @@ import httpx
 
 from .event_log import get_logger
 from .prompts import build_system
-from .schemas import CODE_ROLE, schema_for, validate
+from .schemas import CODE_ROLES, schema_for, validate
 
 # --- Локальное окружение ---------------------------------------------------
 # .env читаем только в разработке; уже заданные переменные не перетираем.
@@ -76,6 +83,8 @@ class LLMConfig:
     timeout: float | None
     code_timeout: float | None
     max_retries: int
+    rate_limit_retries: int
+    rate_limit_wait: float
     temperature: float
     max_tokens: int | None
 
@@ -96,6 +105,8 @@ class LLMConfig:
             timeout=_parse_timeout(os.getenv("LLM_TIMEOUT"), 120.0),
             code_timeout=_parse_timeout(os.getenv("LLM_CODE_TIMEOUT"), None),
             max_retries=int(os.getenv("LLM_MAX_RETRIES", "5")),
+            rate_limit_retries=int(os.getenv("LLM_RATE_LIMIT_RETRIES", "3")),
+            rate_limit_wait=float(os.getenv("LLM_RATE_LIMIT_WAIT", "30")),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             max_tokens=int(max_tokens_raw) if max_tokens_raw else None,
         )
@@ -165,6 +176,13 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """429 от OpenAI-совместимого API (включая Groq)."""
+    if isinstance(exc, openai.RateLimitError):
+        return True
+    return isinstance(exc, openai.APIStatusError) and exc.status_code == 429
+
+
 def _is_unsupported_response_format(exc: Exception) -> bool:
     """Провайдер не умеет response_format=json_object (частый случай у локальных)."""
     text = str(exc).lower()
@@ -179,15 +197,24 @@ def _backoff_delay(attempt: int) -> float:
 def _chat_with_retries(
     client, kwargs: dict, cfg: LLMConfig, log, phase: str | None = None
 ):
-    """Один вызов с сетевыми ретраями. Возвращает (response, номер_попытки)."""
-    last_error: Exception | None = None
-    for attempt in range(cfg.max_retries + 1):
+    """Один вызов с сетевыми ретраями. Возвращает (response, номер_попытки).
+
+    Для 429 используется отдельный лимит `LLM_RATE_LIMIT_RETRIES` и
+    фиксированная пауза `LLM_RATE_LIMIT_WAIT` (по умолчанию 3 × 30 с).
+    Остальные транзиентные ошибки ретраятся с экспоненциальной паузой.
+    """
+    attempt = 0
+    general_retries = 0
+    rate_limit_retries = 0
+
+    while True:
         started = time.time()
         try:
             return client.chat.completions.create(**kwargs), attempt
         except Exception as exc:  # noqa: BLE001 — классифицируем ниже
             duration = time.time() - started
             retryable = _is_retryable(exc)
+            is_rate_limit = _is_rate_limit_error(exc)
             log.log(
                 kind="llm_error",
                 phase=phase,
@@ -195,13 +222,25 @@ def _chat_with_retries(
                 model=cfg.model,
                 duration=round(duration, 3),
                 retryable=retryable,
+                rate_limit=is_rate_limit,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            if not retryable or attempt >= cfg.max_retries:
-                last_error = exc
-                break
-            time.sleep(_backoff_delay(attempt))
-    raise last_error  # type: ignore[misc]
+            if not retryable:
+                raise
+
+            if is_rate_limit:
+                if rate_limit_retries >= cfg.rate_limit_retries:
+                    raise
+                rate_limit_retries += 1
+                wait_seconds = cfg.rate_limit_wait
+            else:
+                if general_retries >= cfg.max_retries:
+                    raise
+                wait_seconds = _backoff_delay(general_retries)
+                general_retries += 1
+
+            time.sleep(wait_seconds)
+            attempt += 1
 
 
 def _accumulate_usage(response) -> tuple[int, int, int]:
@@ -276,33 +315,86 @@ def extract_code(text: str) -> str:
     return text
 
 
+def _build_messages(
+    messages: list[dict], *, role: str | None, system_extra: str | None
+) -> list[dict]:
+    """Поставить системный промпт роли первым сообщением.
+
+    Если вызывающий сам положил system-сообщение, оно остаётся на месте,
+    а `system_extra` дописывается в его конец: явный промпт выигрывает
+    у роли, и тогда роль влияет только на схему и таймаут.
+
+    Аргументы:
+        messages: сообщения от вызывающего кода.
+        role: роль из agent/prompts.py или None (просто чат).
+        system_extra: добавка к системному промпту (описание шага) или None.
+
+    Возвращает:
+        list[dict]: новый список сообщений, исходный не меняется.
+    """
+    result = [dict(message) for message in messages]
+    if not role and not system_extra:
+        return result
+    if result and result[0].get("role") == "system":
+        if system_extra:
+            result[0]["content"] = result[0]["content"].rstrip() + "\n\n" + system_extra
+        return result
+    parts = []
+    if role:
+        parts.append(build_system(role))
+    if system_extra:
+        parts.append(system_extra)
+    result.insert(0, {"role": "system", "content": "\n\n".join(parts)})
+    return result
+
+
 def query(
     messages: list[dict],
     *,
+    role: str | None = None,
+    system_extra: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
     cfg: LLMConfig | None = None,
-    schema: dict | None = None,
-    role: str | None = None,
+    schema=_AUTO,
     phase: str | None = None,
     timeout=_AUTO,
 ) -> str | dict:
-    """Низкоуровневый вызов чата.
+    """Единственный вход к модели: вызов чата с промптом и схемой роли.
 
-    Если задан `schema` — возвращает dict, провалидированный по схеме
-    (с одним corrective-retry). Иначе — текст ответа.
+    `role` определяет две вещи: системный промпт (`agent/prompts/<role>.md`
+    поверх базового) и схему ответа — если `schema` не задана явно.
+    `role=None` — просто чат: промпт и схема берутся только из аргументов.
 
-    `timeout=None` — ждать ответ без лимита (нужно для генерации кода).
-    По умолчанию для роли `code` берётся `LLM_CODE_TIMEOUT` (пусто = без лимита),
-    для остальных ролей — `LLM_TIMEOUT`.
+    Аргументы:
+        messages: сообщения от вызывающего; system подставит роль.
+        role: имя роли из agent/prompts.py (см. ROLES).
+        system_extra: добавка к системному промпту роли (описание шага).
+        schema: JSON-схема ответа. `_AUTO` — взять схему роли; `None` — текст.
+        timeout: лимит ожидания. `_AUTO` — по роли: `code` берёт
+            LLM_CODE_TIMEOUT (пусто = без лимита), остальные — LLM_TIMEOUT.
+            `None` — ждать без лимита.
+
+    Возвращает:
+        dict при structured-ответе (проверен по схеме, один corrective-retry)
+        или str при текстовом; для роли `code` — уже вырезанный код.
+
+    Исключения:
+        KeyError — роли нет в `prompts.ROLES` (опечатка в имени роли);
+        RuntimeError — не задан OPENAI_API_KEY;
+        StructuredOutputError — модель не выдала валидный JSON по схеме.
     """
+    if schema is _AUTO:
+        schema = schema_for(role) if role else None
     cfg = cfg or LLMConfig.from_env()
     if timeout is _AUTO:
-        timeout = cfg.code_timeout if role == CODE_ROLE else cfg.timeout
+        timeout = cfg.code_timeout if role in CODE_ROLES else cfg.timeout
     client = _get_client(cfg)
     log = get_logger("llm")
 
-    base_messages = _with_schema_instruction(messages, schema)
+    base_messages = _with_schema_instruction(
+        _build_messages(messages, role=role, system_extra=system_extra), schema
+    )
     base_kwargs: dict = {
         "model": cfg.model,
         "temperature": cfg.temperature if temperature is None else temperature,
@@ -355,7 +447,7 @@ def query(
         )
 
         if schema is None:
-            return text
+            return extract_code(text) if role in CODE_ROLES else text
 
         parsed, problem = _parse_and_validate(text, schema)
         if parsed is not None:
@@ -386,34 +478,6 @@ def query(
     )
 
 
-def complete(
-    role: str,
-    user: str,
-    *,
-    schema=_AUTO,
-    phase: str | None = None,
-    **kwargs,
-) -> str | dict:
-    """Высокоуровневый вызов: системный промпт роли + пользовательский текст.
-
-    Схема выбирается по роли автоматически (см. agent/schemas.py).
-    Для роли `code` из ответа вырезается markdown-блок с кодом.
-    """
-    if schema is _AUTO:
-        schema = schema_for(role)
-
-    system = build_system(role)
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    result = query(messages, schema=schema, role=role, phase=phase, **kwargs)
-
-    if role == CODE_ROLE and schema is None and isinstance(result, str):
-        return extract_code(result)
-    return result
-
-
 def describe() -> dict:
     """Краткая сводка конфига для отладки (ключ замаскирован)."""
     cfg = LLMConfig.from_env()
@@ -423,6 +487,8 @@ def describe() -> dict:
         "timeout": cfg.timeout,
         "code_timeout": cfg.code_timeout,
         "max_retries": cfg.max_retries,
+        "rate_limit_retries": cfg.rate_limit_retries,
+        "rate_limit_wait": cfg.rate_limit_wait,
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "api_key": (cfg.api_key[:6] + "…") if cfg.api_key else None,

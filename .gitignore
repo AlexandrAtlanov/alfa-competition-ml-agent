@@ -17,3 +17,6 @@ to_do.md
 
 .pytest_cache/
 dist/
+
+# рабочие каталоги прогонов
+.agent_work/
