@@ -1428,7 +1428,8 @@ def run(task_md: str | Path, t0: float | None = None, cfg: LoopConfig | None = N
     cfg = cfg or LoopConfig.from_env()
     log = get_logger("loop")
     task_md = Path(task_md).resolve()
-    deadline = t0 + cfg.time_budget - cfg.safety_margin
+    margin = min(cfg.safety_margin, 0.25 * cfg.time_budget)
+    deadline = t0 + cfg.time_budget - margin
 
     log.log(kind="phase", phase="SCOUT", config=cfg.__dict__)
     ctx = scout(task_md, deadline)
