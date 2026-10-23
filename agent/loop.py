@@ -1,4 +1,4 @@
-"""Автомат фаз агента: SCOUT -> BASELINE -> RESEARCH -> FINALIZE.
+"""Автомат фаз агента: SCOUT -> BASELINE -> RESEARCH -> ENSEMBLE -> FINALIZE.
 
 Принципы:
 - сабмит существует с конца BASELINE и перезаписывается атомарно при каждом
@@ -67,6 +67,10 @@ class LoopConfig:
     exp_timeout_cap: float = 2400.0  # потолок на один эксперимент
     batch_size: int = 4              # кандидатов в одном запросе к LLM
     llm_timeout: float = 180.0
+    ensemble: bool = True            # фаза ENSEMBLE после RESEARCH
+    ensemble_seeds: int = 2          # перезапусков лучшей спеки с другим seed
+    ensemble_top: int = 8            # сколько лучших экспериментов в пуле блендинга
+    ensemble_steps: int = 25         # шагов жадного отбора
 
     @classmethod
     def from_env(cls) -> "LoopConfig":
@@ -86,6 +90,9 @@ class LoopConfig:
             dry_run=os.getenv("AGENT_DRY_RUN", "").strip().lower() in ("1", "true", "yes"),
             exp_timeout_cap=_env_float("AGENT_EXP_TIMEOUT", cls.exp_timeout_cap),
             batch_size=int(_env_float("AGENT_BATCH_SIZE", cls.batch_size)),
+            ensemble=os.getenv("AGENT_ENSEMBLE", "1").strip().lower() not in ("0", "false", "no"),
+            ensemble_seeds=int(_env_float("AGENT_ENSEMBLE_SEEDS", cls.ensemble_seeds)),
+            ensemble_top=int(_env_float("AGENT_ENSEMBLE_TOP", cls.ensemble_top)),
         )
 
 
@@ -112,6 +119,8 @@ class TaskContext:
     deadline: float
     sample: pd.DataFrame = field(repr=False, default=None)
     test_ids: pd.Series = field(repr=False, default=None)
+    y: np.ndarray = field(repr=False, default=None)      # таргет; классы -> 0..K-1
+    folds: list = field(repr=False, default=None)        # те же фолды, что в train_eval
 
     @property
     def submission_path(self) -> Path:
@@ -170,6 +179,12 @@ def scout(task_md: Path, deadline: float) -> TaskContext:
     prof = tools.profile(train, target, id_col)
     task_type = prof["task"]
     classes = sorted(train[target].unique()) if task_type == "classification" else None
+    if classes is not None:
+        y = train[target].map({c: i for i, c in enumerate(classes)}).to_numpy()
+    else:
+        y = train[target].astype(float).to_numpy()
+    # фолды зависят только от числа строк и y (как в wrapper) — для блендинга OOF
+    folds = list(tools.get_splitter(task_type).split(np.zeros((len(y), 1)), y))
 
     dd_path = data_dir / "data_dictionary.csv"
     if not dd_path.exists():
@@ -195,6 +210,8 @@ def scout(task_md: Path, deadline: float) -> TaskContext:
         deadline=deadline,
         sample=sample,
         test_ids=test_ids,
+        y=y,
+        folds=folds,
     )
 
 
@@ -1139,13 +1156,15 @@ def research(ctx: TaskContext, cfg: LoopConfig, reg: Registry, log) -> None:
     while True:
         best = reg.best()
         best_spec = ExperimentSpec(**best.spec)
-        remaining = ctx.remaining()
+        # время после резерва под ансамбль
+        remaining = ctx.remaining() - ensemble_reserve(cfg, reg)
         if iters >= cfg.max_iters or no_improve >= cfg.patience:
             log.log(kind="research_stop", reason="iters/patience", iters=iters,
                     no_improve=no_improve)
             return
         if remaining < max(60.0, 1.2 * reg.median_duration()):
-            log.log(kind="research_stop", reason="время", remaining=round(remaining))
+            log.log(kind="research_stop", reason="время", remaining=round(remaining),
+                    ensemble_reserve=round(ensemble_reserve(cfg, reg)))
             return
 
         tried = reg.tried_keys()
@@ -1178,6 +1197,198 @@ def research(ctx: TaskContext, cfg: LoopConfig, reg: Registry, log) -> None:
             no_improve += 1
 
 
+# ----------------------------- ансамбль -----------------------------------
+# Блендинг идёт по OOF на тех же фолдах, что у всех экспериментов, поэтому
+# скор ансамбля сравним со скором одиночной модели и проходит тот же judge.
+# greedy_blend — временная реализация зоны A; когда в tools появится
+# блендинг от B, достаточно заменить вызов в ensemble_phase.
+
+def ensemble_reserve(cfg: LoopConfig, reg: Registry) -> float:
+    """
+    Оценивает время, которое RESEARCH оставляет под фазу ENSEMBLE.
+
+    Аргументы:
+    cfg (LoopConfig): настройки цикла
+    reg (Registry): реестр (медианная длительность)
+
+    Возвращает:
+    float: секунды (0, если ансамбль выключен)
+    """
+    if not cfg.ensemble:
+        return 0.0
+    return cfg.ensemble_seeds * 1.2 * reg.median_duration() + 30.0
+
+
+def score_pred(ctx: TaskContext, pred: np.ndarray, idx: np.ndarray | None = None) -> float:
+    """
+    Считает метрику задачи по OOF-предсказаниям.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи (y, тип задачи)
+    pred (np.ndarray): OOF — вероятности (n, K) или значения (n,)
+    idx (np.ndarray | None): подмножество строк; None — все
+
+    Возвращает:
+    float
+    """
+    y, p = (ctx.y, pred) if idx is None else (ctx.y[idx], pred[idx])
+    if ctx.task_type == "classification":
+        return tools.macro_f1(y, p.argmax(axis=1))
+    return tools.rmse(y, p)
+
+
+def fold_scores_of(ctx: TaskContext, pred: np.ndarray) -> list[float]:
+    """
+    Считает метрику по каждому фолду CV.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи (folds)
+    pred (np.ndarray): OOF-предсказания
+
+    Возвращает:
+    list[float]
+    """
+    return [score_pred(ctx, pred, va) for _, va in ctx.folds]
+
+
+def greedy_blend(ctx: TaskContext, oofs: list[np.ndarray], max_steps: int) -> tuple[np.ndarray, float]:
+    """
+    Жадно отбирает членов ансамбля с повторами (Caruana) по OOF-скору.
+
+    На каждом шаге добавляет модель, которая сильнее всего улучшает
+    среднее; останавливается, когда улучшений нет.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи
+    oofs (list[np.ndarray]): OOF-предсказания кандидатов
+    max_steps (int): максимум шагов отбора
+
+    Возвращает:
+    tuple[np.ndarray, float]: (веса членов, сумма = 1; скор ансамбля)
+    """
+    counts = np.zeros(len(oofs), dtype=int)
+    current, best_score = None, None
+    for _ in range(max_steps):
+        k = counts.sum()
+        step = None
+        for i, oof in enumerate(oofs):
+            cand = oof if current is None else (current * k + oof) / (k + 1)
+            s = score_pred(ctx, cand)
+            if step is None or improvement(ctx, step[0], s) > 0:
+                step = (s, i, cand)
+        s, i, cand = step
+        if best_score is not None and improvement(ctx, best_score, s) <= 1e-12:
+            break
+        counts[i] += 1
+        current, best_score = cand, s
+    return counts / counts.sum(), best_score
+
+
+def seed_bagging(ctx: TaskContext, cfg: LoopConfig, reg: Registry, log) -> None:
+    """
+    Перезапускает лучшую спеку с другими random_state — разнообразие для ансамбля.
+
+    Фолды CV не меняются (их seed фиксирован в tools), меняется только
+    случайность бустинга (subsample / colsample).
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи
+    cfg (LoopConfig): настройки цикла
+    reg (Registry): реестр
+    log (JsonlLogger): логгер loop.jsonl
+    """
+    best = reg.best()
+    best_spec = ExperimentSpec(**best.spec)
+    for i in range(cfg.ensemble_seeds):
+        if ctx.remaining() < 1.2 * reg.median_duration() + 30:
+            log.log(kind="seed_bagging_stop", reason="время", done=i)
+            return
+        seed = tools.SEED + 1 + i
+        cand = Candidate(f"seed-бэггинг: random_state={seed}",
+                         "Та же спека с другим seed бустинга — член ансамбля.",
+                         "ensemble", {"lgbm_params": {"random_state": seed}})
+        spec = best_spec.merge(cand.delta)
+        if spec.signature() in reg.tried_signatures():
+            continue
+        rec = run_spec(ctx, reg, spec, candidate=cand, parent_id=best.exp_id,
+                       phase="ENSEMBLE", timeout=exp_timeout(ctx, cfg, reg))
+        rec.reason = rec.reason or "член ансамбля (seed)"
+        reg.add(rec)
+        log.log(kind="seed_run", exp_id=rec.exp_id, seed=seed, status=rec.status,
+                cv_score=rec.cv_score, best_score=best.cv_score, duration=rec.duration)
+
+
+def ensemble_phase(ctx: TaskContext, cfg: LoopConfig, reg: Registry, log) -> ExperimentRecord | None:
+    """
+    Собирает ансамбль из лучших экспериментов и принимает его через judge.
+
+    Аргументы:
+    ctx (TaskContext): контекст задачи
+    cfg (LoopConfig): настройки цикла
+    reg (Registry): реестр
+    log (JsonlLogger): логгер loop.jsonl
+
+    Возвращает:
+    ExperimentRecord | None: запись ансамбля (принятого или нет) или None, если не собирали
+    """
+    t0 = time.time()
+    best = reg.best()
+    # сверка фолдов: OOF из песочницы должен давать те же фолд-скоры
+    best_oof = np.load(best.artifacts["oof"])
+    if not np.allclose(fold_scores_of(ctx, best_oof), best.fold_scores, rtol=1e-6, atol=1e-9):
+        log.log(kind="ensemble_skip", reason="фолды цикла не совпали с фолдами песочницы")
+        return None
+
+    seed_bagging(ctx, cfg, reg, log)
+
+    pool = [r for r in reg.records
+            if r.status == "ok" and len(r.fold_scores) == tools.N_FOLDS
+            and r.artifacts.get("oof")]
+    reverse = ctx.direction == "max"
+    pool = sorted(pool, key=lambda r: r.cv_score, reverse=reverse)[:cfg.ensemble_top]
+    if len(pool) < 2:
+        log.log(kind="ensemble_skip", reason=f"мало экспериментов: {len(pool)}")
+        return None
+
+    oofs = [np.load(r.artifacts["oof"]) for r in pool]
+    weights, score = greedy_blend(ctx, oofs, cfg.ensemble_steps)
+    members = {pool[i].exp_id: round(float(w), 4) for i, w in enumerate(weights) if w > 0}
+    if len(members) < 2:
+        log.log(kind="ensemble_skip", reason="блендинг выбрал одну модель",
+                members=members, score=score)
+        return None
+
+    oof = sum(w * o for w, o in zip(weights, oofs) if w > 0)
+    test_pred = sum(w * np.load(r.artifacts["test_pred"])
+                    for w, r in zip(weights, pool) if w > 0)
+    exp_id = reg.next_id()
+    exp_dir = ctx.work_dir / f"exp_{exp_id:03d}"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    np.save(exp_dir / "oof.npy", oof)
+    np.save(exp_dir / "test_pred.npy", test_pred)
+
+    cand = Candidate("Ансамбль: " + ", ".join(f"#{k}×{v}" for k, v in members.items()),
+                     "Жадный блендинг OOF лучших экспериментов и seed-перезапусков.",
+                     "ensemble", {})
+    rec = ExperimentRecord(
+        exp_id=exp_id, parent_id=best.exp_id, phase="ENSEMBLE",
+        candidate=cand.to_dict(), spec=best.spec,
+        signature="blend:" + ",".join(f"{k}={v}" for k, v in members.items()),
+        status="ok", cv_score=float(score), fold_scores=fold_scores_of(ctx, oof),
+        duration=round(time.time() - t0, 3),
+        artifacts={"dir": str(exp_dir), "oof": str(exp_dir / "oof.npy"),
+                   "test_pred": str(exp_dir / "test_pred.npy"), "members": members},
+    )
+    rec.accepted, rec.reason = judge(ctx, rec, best)
+    reg.add(rec)
+    log.log(kind="ensemble", exp_id=rec.exp_id, members=members, cv_score=rec.cv_score,
+            best_score=best.cv_score, accepted=rec.accepted, reason=rec.reason)
+    if rec.accepted:
+        write_submission(ctx, rec)
+        log.log(kind="new_best", exp_id=rec.exp_id, cv_score=rec.cv_score)
+    return rec
+
+
 def finalize(ctx: TaskContext, reg: Registry, log) -> None:
     """
     Пишет сабмит лучшего эксперимента и проверяет его формат.
@@ -1203,7 +1414,7 @@ def finalize(ctx: TaskContext, reg: Registry, log) -> None:
 
 def run(task_md: str | Path, t0: float | None = None, cfg: LoopConfig | None = None) -> dict:
     """
-    Выполняет полный прогон одной задачи: SCOUT -> BASELINE -> RESEARCH -> FINALIZE.
+    Выполняет полный прогон одной задачи: SCOUT -> BASELINE -> RESEARCH -> ENSEMBLE -> FINALIZE.
 
     Аргументы:
     task_md (str | Path): путь к task.md
@@ -1236,6 +1447,13 @@ def run(task_md: str | Path, t0: float | None = None, cfg: LoopConfig | None = N
             research(ctx, cfg, reg, log)
         except Exception as exc:  # noqa: BLE001 — лучший результат уже в сабмите
             log.log(kind="research_error", error=f"{type(exc).__name__}: {exc}")
+
+        if cfg.ensemble:
+            log.log(kind="phase", phase="ENSEMBLE", remaining=round(ctx.remaining()))
+            try:
+                ensemble_phase(ctx, cfg, reg, log)
+            except Exception as exc:  # noqa: BLE001 — без ансамбля остаётся лучшая модель
+                log.log(kind="ensemble_error", error=f"{type(exc).__name__}: {exc}")
 
     log.log(kind="phase", phase="FINALIZE", remaining=round(ctx.remaining()))
     finalize(ctx, reg, log)
