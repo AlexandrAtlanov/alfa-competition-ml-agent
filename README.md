@@ -63,6 +63,24 @@ python solution.py examples/simple_task/task.md
 - логи: `logs/llm.jsonl`, `logs/loop.jsonl`, `logs/exec.jsonl`;
 - тесты: `python -m pytest tests/ -q`.
 
+### Демо-цикл по шагам (`scripts/run_cycle.py`)
+
+Облегчённая dev-обвязка без полного автомата фаз: hypothesis -> code ->
+запуск в песочнице -> review -> accept/reject. Полезна, чтобы видеть каждый
+шаг в терминале и проверить связку llm + prompts + sandbox.
+
+```bash
+# без LLM: заготовки вместо ответов модели, код исполняется по-настоящему
+python scripts/run_cycle.py --task examples/simple_task --cycles 2 --dry-run
+
+# реальный прогон (нужен .env)
+python scripts/run_cycle.py --task examples/simple_task --cycles 2
+```
+
+- `--cycles N` — сколько гипотез проверить (по умолчанию 1);
+- `--timeout S` — лимит на исполнение сгенерированного кода (по умолчанию 300 с);
+- `--dry-run` — не звать модель, но прогнать всю механику.
+
 ## LLM-слой
 
 Единственная точка вызова — `agent.llm.query()`. Роль (`role`) задаёт системный
