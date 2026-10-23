@@ -18,7 +18,7 @@
 solution.py               # точка входа: интерфейс baseline, таймер, деградация
 agent/
   loop.py                 # автомат фаз: SCOUT -> BASELINE -> RESEARCH -> FINALIZE
-  llm.py                  # единственная обертка API Qwen: ретраи, бюджет, кэш
+  llm.py                  # единственная обертка API: роли, ретраи (429), бюджет
   tools.py                # детерминированные инструменты: profile, train_eval, submission
   registry.py             # реестр экспериментов (experiments.json)
   prompts/
@@ -51,18 +51,26 @@ cp .env.example .env
 # сгенерировать тестовую задачу
 python scripts/make_demo_task.py
 
-# прогон без LLM: проверяет песочницу, метрику и accept/reject
-python scripts/run_cycle.py --task examples/simple_task --cycles 2 --dry-run
+# прогон без LLM: песочница, метрика и accept/reject работают по-настоящему
+AGENT_DRY_RUN=1 python solution.py examples/simple_task/task.md
 
 # реальный прогон (нужен .env)
-python scripts/run_cycle.py --task examples/simple_task --cycles 2
+python solution.py examples/simple_task/task.md
 ```
 
-- `--cycles N` — сколько гипотез проверить;
-- `--timeout S` — лимит на исполнение сгенерированного кода (по умолчанию 300 с);
-- `--dry-run` — заготовки вместо вызова модели, но код исполняется по-настоящему;
-- логи: `logs/llm.jsonl`, `logs/exec.jsonl`;
-- тесты инструментов: `python -m pytest tests/ -q`.
+- `AGENT_DRY_RUN=1` — заготовки вместо вызова модели, код исполняется по-настоящему;
+- бюджет: `AGENT_TIME_BUDGET` (3 ч по умолчанию), `AGENT_MAX_ITERS`, `AGENT_PATIENCE`;
+- логи: `logs/llm.jsonl`, `logs/loop.jsonl`, `logs/exec.jsonl`;
+- тесты: `python -m pytest tests/ -q`.
+
+## LLM-слой
+
+Единственная точка вызова — `agent.llm.query()`. Роль (`role`) задаёт системный
+промпт `agent/prompts/<role>.md`, схему ответа и таймаут; для роли `code` из
+ответа вырезается markdown-блок. Отдельной обёртки `complete()` нет.
+
+Ретраи: транзиентные ошибки — экспоненциальная пауза; 429 — отдельные
+`LLM_RATE_LIMIT_RETRIES` / `LLM_RATE_LIMIT_WAIT` (по умолчанию 3 × 30 с).
 
 `requirements-dev.txt` — только для локальной разработки; в ZIP для платформы
 идёт `requirements-org.txt` (переименовывается в `requirements.txt`).

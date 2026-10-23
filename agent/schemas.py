@@ -2,7 +2,7 @@
 
 Разделение:
 - `analyze_task`, `hypothesis`, `review` — возвращают JSON (схема ниже);
-- `code` — возвращает текст (markdown-блок), схема не нужна.
+- `code`, `patch` — возвращают текст с кодом (markdown-блок), схема не нужна.
 
 Валидатор — минимальный, без внешних зависимостей: поддерживает только
 те ключевые слова, которые используются в схемах (type, enum, required,
@@ -76,8 +76,9 @@ SCHEMAS: dict[str, dict] = {
     "review": REVIEW_SCHEMA,
 }
 
-# Роли, для которых llm.py ожидает текст, а не JSON.
-CODE_ROLE = "code"
+# Роли, для которых llm.py ожидает текст, а не JSON: из ответа вырезается
+# markdown-блок с кодом, а таймаут берётся длинный (LLM_CODE_TIMEOUT).
+CODE_ROLES = frozenset({"code", "patch"})
 
 
 def schema_for(role: str) -> dict | None:

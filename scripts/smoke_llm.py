@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.llm import complete, describe, get_usage  # noqa: E402
+from agent.llm import describe, get_usage, query  # noqa: E402
 
 PROMPT = (
     "Данные: train.csv (признаки + таргет), test.csv. "
@@ -26,7 +26,7 @@ PROMPT = (
 def main() -> int:
     print("Конфиг:", describe())
     print("\n--- запрос (structured: hypothesis) ---")
-    answer = complete("hypothesis", PROMPT)
+    answer = query([{"role": "user", "content": PROMPT}], role="hypothesis")
     if isinstance(answer, dict):
         print(json.dumps(answer, ensure_ascii=False, indent=2))
     else:
